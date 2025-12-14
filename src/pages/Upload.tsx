@@ -73,9 +73,11 @@ const Upload: React.FC = () => {
             alert("Upload Successful! (Points +10 pending)");
             navigate('/upload-success');
 
-        } catch (err) {
+        } catch (err: any) {
             console.error(err);
-            setError("Failed to upload. Please try again.");
+            const msg = err.message || "Failed to upload. Please try again.";
+            alert(`Error: ${msg}`);
+            setError(msg);
             setUploading(false);
         }
     };
