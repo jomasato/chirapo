@@ -1,0 +1,48 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    
+    // users collection
+    match /users/{userId} {
+      // Users can read/write their own profile
+      allow read, write: if request.auth != null && request.auth.uid == userId;
+      // Allow reading basic info for ranking (handled purely by client query in MVP?)
+      // Actually, for the Ranking page query "collection(db, 'users')", we need list access.
+      // Ideally restricted, but for Phase 0 MVP allowing read to authenticated users is acceptable for leaderboard.
+      allow list: if request.auth != null; 
+    }
+    
+    // photos collection
+    match /photos/{photoId} {
+      // Everyone can read (for timeline/ranking feeds)
+      allow read: if request.auth != null;
+      
+      // Users can create their own photos
+      allow create: if request.auth != null && 
+                       request.resource.data.userId == request.auth.uid;
+      
+      // Users can update/delete their own photos
+      allow update, delete: if request.auth != null && 
+                              resource.data.userId == request.auth.uid;
+    }
+    
+    // pointTransactions collection
+    match /pointTransactions/{transactionId} {
+      // Users can read their own transactions
+      allow read: if request.auth != null && 
+                     resource.data.userId == request.auth.uid;
+      
+      // Writes are Server-only (Cloud Functions)
+      allow write: if false;
+    }
+    
+    // leaderboard collection
+    match /leaderboard/{weekId} {
+      // Everyone can read
+      allow read: if request.auth != null;
+      
+      // Writes are Server-only
+      allow write: if false;
+    }
+  }
+}
