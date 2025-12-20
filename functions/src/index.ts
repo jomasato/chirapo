@@ -12,7 +12,8 @@ const client = new vision.ImageAnnotatorClient();
  * - Checks for duplicates (hash-based)
  * - Performs OCR using Google Cloud Vision
  * - Classifies the flyer
- * - Saves metadata to Firestore
+ * - Saves metadata to Firestore (status: pending)
+ * - Adds to User's "pendingPoints"
  */
 export const onPhotoUpload = functions.storage.object().onFinalize(async (object) => {
     const filePath = object.name; // e.g., users/{userId}/photos/{timestamp}.jpg
@@ -30,24 +31,20 @@ export const onPhotoUpload = functions.storage.object().onFinalize(async (object
         return;
     }
 
-    // Extract userId
-    // path: users/{userId}/photos/{photoId}
     const parts = filePath.split('/');
     const userId = parts[1];
 
     console.log(`Processing photo: ${filePath} for user: ${userId}`);
 
     try {
-        // 1. Download file to memory to calculate hash
-        // Note: For very large files, streaming is better, but we limit to 5MB/1MB client-side.
         const bucket = admin.storage().bucket(bucketName);
         const file = bucket.file(filePath);
         const [fileBuffer] = await file.download();
 
-        // 2. Calculate Hash
+        // Calculate Hash
         const imageHash = crypto.createHash('sha256').update(fileBuffer).digest('hex');
 
-        // 3. Duplicate Check
+        // Duplicate Check
         const duplicatesSnapshot = await db.collection('photos')
             .where('imageHash', '==', imageHash)
             .limit(1)
@@ -57,38 +54,40 @@ export const onPhotoUpload = functions.storage.object().onFinalize(async (object
         if (!duplicatesSnapshot.empty) {
             console.log(`Duplicate detected: ${imageHash}`);
             isDuplicate = true;
-            // We still process it but flag it
         }
 
-        // 4. OCR
+        // OCR
         const [result] = await client.textDetection(`gs://${bucketName}/${filePath}`);
         const detections = result.textAnnotations;
         const ocrText = detections && detections.length > 0 ? detections[0].description : '';
 
-        // 5. Categorization
+        // Categorization
         const category = categorizeFlyer(ocrText || '');
 
-        // 6. Save to Firestore
+        // Save to Firestore
+        const photoRef = db.collection('photos').doc();
         const photoData = {
+            id: photoRef.id,
             userId,
             filePath,
-            storageUrl: `gs://${bucketName}/${filePath}`, // Internal path
+            storageUrl: `gs://${bucketName}/${filePath}`,
             imageHash,
             ocrText,
             category,
             isDuplicate,
+            status: isDuplicate ? 'rejected' : 'pending', // Duplicates automatically rejected
             createdAt: admin.firestore.FieldValue.serverTimestamp(),
-            // Metadata from client (customMetadata)
             clientMetadata: object.metadata || {},
-            status: 'processed'
         };
 
-        await db.collection('photos').add(photoData);
+        await photoRef.set(photoData);
         console.log('Photo processed and saved to Firestore.');
 
-        // 7. Award Points (if valid and not duplicate)
+        // Add to Pending Points (if not duplicate)
         if (!isDuplicate) {
-            await awardPoints(userId, 10, imageHash);
+            await addPendingPoints(userId, 10);
+        } else {
+            console.log('Duplicate photo, no pending points added.');
         }
 
     } catch (error) {
@@ -105,65 +104,118 @@ function categorizeFlyer(text: string): string {
 }
 
 /**
- * atomic transaction to award points and update stats
+ * Increment User's pendingPoints
  */
-async function awardPoints(userId: string, amount: number, photoId: string) {
+async function addPendingPoints(userId: string, amount: number) {
     const userRef = db.collection('users').doc(userId);
-    const transactionRef = db.collection('pointTransactions').doc();
-
     try {
-        await db.runTransaction(async (t) => {
-            const userDoc = await t.get(userRef);
-            if (!userDoc.exists) {
-                throw new Error('User does not exist!');
-            }
-
-            const userData = userDoc.data() || {};
-            const currentPoints = userData.points || 0;
-            const currentTotal = userData.totalPhotos || 0;
-            const currentWeekly = userData.weeklyPhotos || 0;
-            const currentMonthly = userData.monthlyPhotos || 0;
-
-            // Update User
-            t.update(userRef, {
-                points: currentPoints + amount,
-                totalPhotos: currentTotal + 1,
-                weeklyPhotos: currentWeekly + 1,
-                monthlyPhotos: currentMonthly + 1,
-                lastActiveAt: admin.firestore.FieldValue.serverTimestamp()
-            });
-
-            // Create Transaction Record
-            t.set(transactionRef, {
-                userId,
-                type: 'earn',
-                amount,
-                reason: 'photo_upload',
-                relatedPhotoId: photoId,
-                createdAt: admin.firestore.FieldValue.serverTimestamp()
-            });
+        await userRef.update({
+            pendingPoints: admin.firestore.FieldValue.increment(amount),
+            lastActiveAt: admin.firestore.FieldValue.serverTimestamp()
         });
-        console.log(`Awarded ${amount} points to ${userId}`);
+        console.log(`Added ${amount} pending points to ${userId}`);
     } catch (e) {
-        console.error('Transaction failure:', e);
+        console.error('Failed to add pending points:', e);
     }
 }
 
 /**
- * Scheduled function to update leaderboard every Monday at 00:00 JST
- * - Snapshots top 100 users for the previous week
- * - Resets weeklyPhotos for ALL users
+ * Admin: Approve a pending photo
  */
+export const approvePhoto = functions.https.onCall(async (data, context) => {
+    if (!context.auth) throw new functions.https.HttpsError('unauthenticated', 'Login required.');
+
+    // Check Admin (In real app, use Custom Claims. For MVP, checking user doc is okay-ish but slower)
+    const adminUser = await db.collection('users').doc(context.auth.uid).get();
+    if (!adminUser.data()?.isAdmin) {
+        throw new functions.https.HttpsError('permission-denied', 'Admin only.');
+    }
+
+    const { photoId } = data;
+    const photoRef = db.collection('photos').doc(photoId);
+
+    await db.runTransaction(async (t) => {
+        const photoDoc = await t.get(photoRef);
+        if (!photoDoc.exists) throw new functions.https.HttpsError('not-found', 'Photo not found.');
+
+        const photo = photoDoc.data();
+        if (photo?.status !== 'pending') throw new functions.https.HttpsError('failed-precondition', 'Photo is not pending.');
+
+        const userId = photo.userId;
+        const rewardAmount = 10; // Fixed for now
+
+        // Update Photo
+        t.update(photoRef, { status: 'approved' });
+
+        // Update User (Move Pending -> Actual)
+        const userRef = db.collection('users').doc(userId);
+        t.update(userRef, {
+            pendingPoints: admin.firestore.FieldValue.increment(-rewardAmount),
+            points: admin.firestore.FieldValue.increment(rewardAmount),
+            totalPhotos: admin.firestore.FieldValue.increment(1),
+            weeklyPhotos: admin.firestore.FieldValue.increment(1) // Assuming weekly counts APPROVED photos
+        });
+
+        // Create Earn Transaction
+        const transactionRef = db.collection('pointTransactions').doc();
+        t.set(transactionRef, {
+            userId,
+            type: 'earn',
+            amount: rewardAmount,
+            reason: 'photo_approval',
+            relatedPhotoId: photoId,
+            createdAt: admin.firestore.FieldValue.serverTimestamp()
+        });
+    });
+
+    return { success: true };
+});
+
+/**
+ * Admin: Reject a pending photo
+ */
+export const rejectPhoto = functions.https.onCall(async (data, context) => {
+    if (!context.auth) throw new functions.https.HttpsError('unauthenticated', 'Login required.');
+
+    const adminUser = await db.collection('users').doc(context.auth.uid).get();
+    if (!adminUser.data()?.isAdmin) {
+        throw new functions.https.HttpsError('permission-denied', 'Admin only.');
+    }
+
+    const { photoId } = data;
+    const photoRef = db.collection('photos').doc(photoId);
+
+    await db.runTransaction(async (t) => {
+        const photoDoc = await t.get(photoRef);
+        if (!photoDoc.exists) throw new functions.https.HttpsError('not-found', 'Photo not found.');
+        const photo = photoDoc.data();
+        if (photo?.status !== 'pending') throw new functions.https.HttpsError('failed-precondition', 'Photo is not pending.');
+
+        const userId = photo.userId;
+        const rewardAmount = 10;
+
+        // Update Photo
+        t.update(photoRef, { status: 'rejected' });
+
+        // Update User (Remove Pending)
+        const userRef = db.collection('users').doc(userId);
+        t.update(userRef, {
+            pendingPoints: admin.firestore.FieldValue.increment(-rewardAmount)
+        });
+    });
+
+    return { success: true };
+});
+
+
 export const updateLeaderboard = functions.pubsub.schedule('0 0 * * 1')
     .timeZone('Asia/Tokyo')
     .onRun(async (context) => {
+        // ... (Same logic, can be optimized later)
         const now = new Date();
-        // Previous week ID e.g. "2024-W40"
-        // Simply using ISO string for simplicity in MVP, ideally use a library like date-fns
         const weekId = now.toISOString().split('T')[0];
 
         try {
-            // 1. Get Top 100 Users
             const usersSnapshot = await db.collection('users')
                 .orderBy('weeklyPhotos', 'desc')
                 .limit(100)
@@ -177,52 +229,31 @@ export const updateLeaderboard = functions.pubsub.schedule('0 0 * * 1')
                 rank: index + 1,
             }));
 
-            // 2. Save Leaderboard
             await db.collection('leaderboard').doc(weekId).set({
                 weekId,
                 rankings,
                 updatedAt: admin.firestore.FieldValue.serverTimestamp(),
             });
-            console.log(`Leaderboard saved for ${weekId}`);
 
-            // 3. Reset weeklyPhotos for ALL users (Batching required for >500 users)
-            // For MVP (Phase 0), we assume < 500 users or accept simple batching
             const allUsersSnapshot = await db.collection('users').where('weeklyPhotos', '>', 0).get();
-
-            if (allUsersSnapshot.empty) {
-                console.log('No users active this week.');
-                return;
+            if (!allUsersSnapshot.empty) {
+                const batch = db.batch();
+                allUsersSnapshot.docs.forEach((doc) => {
+                    batch.update(doc.ref, { weeklyPhotos: 0 });
+                });
+                await batch.commit();
             }
-
-            const batch = db.batch();
-            allUsersSnapshot.docs.forEach((doc) => {
-                batch.update(doc.ref, { weeklyPhotos: 0 });
-            });
-
-            await batch.commit();
-            console.log(`Reset weekly stats for ${allUsersSnapshot.size} users.`);
-
         } catch (error) {
             console.error('Error updating leaderboard:', error);
         }
     });
 
-/**
- * Callable function for users to request point exchange
- * - Deducts 1000 points
- * - Creates a redemption request
- */
 export const requestExchange = functions.https.onCall(async (data, context) => {
-    // 1. Auth Check
-    if (!context.auth) {
-        throw new functions.https.HttpsError('unauthenticated', 'User must be logged in.');
-    }
-    const userId = context.auth.uid;
-    const { name, email } = data; // User provided info for gift card delivery
+    if (!context.auth) throw new functions.https.HttpsError('unauthenticated', 'User must be logged in.');
 
-    if (!name || !email) {
-        throw new functions.https.HttpsError('invalid-argument', 'Name and Email are required.');
-    }
+    const userId = context.auth.uid;
+    const { name, email } = data;
+    if (!name || !email) throw new functions.https.HttpsError('invalid-argument', 'Missing info.');
 
     const REDEMPTION_AMOUNT = 1000;
     const userRef = db.collection('users').doc(userId);
@@ -231,38 +262,32 @@ export const requestExchange = functions.https.onCall(async (data, context) => {
     try {
         await db.runTransaction(async (t) => {
             const userDoc = await t.get(userRef);
-            if (!userDoc.exists) {
-                throw new functions.https.HttpsError('not-found', 'User not found.');
-            }
+            if (!userDoc.exists) throw new functions.https.HttpsError('not-found', 'User not found.');
 
             const currentPoints = userDoc.data()?.points || 0;
             if (currentPoints < REDEMPTION_AMOUNT) {
                 throw new functions.https.HttpsError('failed-precondition', 'Insufficient points.');
             }
 
-            // Deduct Points
             t.update(userRef, {
                 points: currentPoints - REDEMPTION_AMOUNT,
                 lastActiveAt: admin.firestore.FieldValue.serverTimestamp()
             });
 
-            // Create Transaction Record
             t.set(transactionRef, {
                 userId,
                 type: 'redeem',
                 amount: -REDEMPTION_AMOUNT,
                 reason: 'amazon_gift',
                 status: 'pending',
-                redemptionDetails: { name, email }, // Info for manual processing
+                redemptionDetails: { name, email },
                 createdAt: admin.firestore.FieldValue.serverTimestamp()
             });
         });
 
-        return { success: true, message: 'Exchange request submitted.' };
-
+        return { success: true };
     } catch (error) {
         console.error('Exchange failed:', error);
-        if (error instanceof functions.https.HttpsError) throw error;
-        throw new functions.https.HttpsError('internal', 'Exchange transaction failed.');
+        throw error;
     }
 });

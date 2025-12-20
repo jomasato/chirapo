@@ -20,11 +20,11 @@ const UploadSuccess: React.FC = () => {
                 <CheckCircle className="w-24 h-24 text-primary" />
             </div>
 
-            <h1 className="text-3xl font-bold text-gray-800 mb-2">Upload Complete!</h1>
-            <p className="text-xl text-primary font-bold mb-8">+10 Points Awarded</p>
+            <h1 className="text-3xl font-bold text-gray-800 mb-2">Upload Submitted!</h1>
+            <p className="text-xl text-orange-500 font-bold mb-8">Pending Review (+10 pts)</p>
 
             <p className="text-gray-500 mb-8 max-w-xs">
-                Your flyer is being processed. Thank you for your contribution!
+                Your flyer has been sent for review. Points will be awarded upon approval.
             </p>
 
             <button

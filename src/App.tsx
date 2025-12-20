@@ -7,6 +7,7 @@ import UploadSuccess from './pages/UploadSuccess';
 import MyPage from './pages/MyPage';
 import Exchange from './pages/Exchange';
 import Ranking from './pages/Ranking';
+import AdminDashboard from './pages/AdminDashboard';
 import Layout from './components/Layout';
 import { ProtectedRoute } from './components/ProtectedRoute';
 
@@ -28,6 +29,7 @@ function App() {
             <Route path="mypage" element={<MyPage />} />
             <Route path="exchange" element={<Exchange />} />
             <Route path="ranking" element={<Ranking />} />
+            <Route path="admin" element={<AdminDashboard />} />
           </Route>
 
           <Route path="*" element={<Navigate to="/" replace />} />

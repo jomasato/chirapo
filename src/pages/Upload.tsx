@@ -70,7 +70,7 @@ const Upload: React.FC = () => {
             );
 
             // 3. Success -> Navigate / Show Success
-            alert("Upload Successful! (Points +10 pending)");
+            alert("Upload Submitted! (Pending Review)");
             navigate('/upload-success');
 
         } catch (err: any) {

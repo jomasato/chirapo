@@ -4,10 +4,9 @@ service firebase.storage {
     
     // User photos
     match /users/{userId}/photos/{photoId} {
-      // Upload: Auth required, own folder, size < 5MB
+      // Upload: Auth required, own folder
       allow write: if request.auth != null 
-                   && request.auth.uid == userId 
-                   && request.resource.size < 5 * 1024 * 1024;
+                   && request.auth.uid == userId;
       
       // Read: Public (so admin/other users can see in ranking/etc)
       allow read: if true;
